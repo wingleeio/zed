@@ -2,8 +2,8 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputStateChange, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -34,6 +34,7 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    text_input_state_changes: Vec<TextInputStateChange>,
     is_fullscreen: bool,
 }
 
@@ -86,6 +87,7 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            text_input_state_changes: Vec::new(),
             is_fullscreen: false,
         })))
     }
@@ -122,6 +124,11 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
+        self.0.lock().text_input_state_changes.clone()
     }
 }
 
@@ -177,6 +184,10 @@ impl PlatformWindow for TestWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.lock().input_handler.take()
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        self.0.lock().text_input_state_changes.push(change);
     }
 
     fn prompt(

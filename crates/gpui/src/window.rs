@@ -14,9 +14,10 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TouchGestureArena,
+    TouchGestureOutput, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
     transparent_black,
 };
@@ -578,6 +579,8 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
+pub(crate) type AnyTouchListener =
+    Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
@@ -864,6 +867,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) touch_listeners: Vec<Option<AnyTouchListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -895,6 +899,7 @@ pub(crate) struct PrepaintStateIndex {
 pub(crate) struct PaintIndex {
     scene_index: usize,
     mouse_listeners_index: usize,
+    touch_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
@@ -910,6 +915,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            touch_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -935,6 +941,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.touch_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1066,6 +1073,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    insets: WindowInsets,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1079,6 +1087,7 @@ pub struct Window {
     #[cfg(feature = "input-latency-histogram")]
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
+    touch_gesture_arena: TouchGestureArena,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -1354,6 +1363,11 @@ impl Window {
             .and_then(|titlebar| titlebar.title.clone());
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let gesture_tuning = cx
+            .platform
+            .gestures()
+            .map(|gestures| gestures.tuning())
+            .unwrap_or_default();
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1388,6 +1402,7 @@ impl Window {
         let capslock = platform_window.capslock();
         let content_size = platform_window.content_size();
         let scale_factor = platform_window.scale_factor();
+        let insets = platform_window.insets();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
@@ -1609,6 +1624,14 @@ impl Window {
                     .log_err();
             }
         }));
+        platform_window.on_insets_changed(Box::new({
+            let mut cx = cx.to_async();
+            move |insets| {
+                handle
+                    .update(&mut cx, |_, window, _cx| window.insets_changed(insets))
+                    .log_err();
+            }
+        }));
         platform_window.on_appearance_changed(Box::new({
             let mut cx = cx.to_async();
             move || {
@@ -1777,6 +1800,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            insets,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -1788,6 +1812,7 @@ impl Window {
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
+            touch_gesture_arena: TouchGestureArena::new(gesture_tuning),
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -2345,6 +2370,11 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// Returns the regions of this window obscured by system UI and the keyboard.
+    pub fn insets(&self) -> &WindowInsets {
+        &self.insets
+    }
+
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
@@ -2370,6 +2400,13 @@ impl Window {
         self.appearance_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    fn insets_changed(&mut self, insets: WindowInsets) {
+        if self.insets != insets {
+            self.insets = insets;
+            self.refresh();
+        }
     }
 
     pub(crate) fn button_layout_changed(&mut self, cx: &mut App) {
@@ -2736,19 +2773,23 @@ impl Window {
         // Place it back into a None slot (left by a previous .take()) so that
         // cached paint_range indices in reuse_paint find the handler at the
         // expected position.
-        if let Some(input_handler) = self.platform_window.take_input_handler() {
-            if let Some(slot) = self
-                .rendered_frame
-                .input_handlers
-                .iter_mut()
-                .rev()
-                .find(|h| h.is_none())
-            {
-                *slot = Some(input_handler);
+        let had_input_handler =
+            if let Some(input_handler) = self.platform_window.take_input_handler() {
+                if let Some(slot) = self
+                    .rendered_frame
+                    .input_handlers
+                    .iter_mut()
+                    .rev()
+                    .find(|h| h.is_none())
+                {
+                    *slot = Some(input_handler);
+                } else {
+                    self.rendered_frame.input_handlers.push(Some(input_handler));
+                }
+                true
             } else {
-                self.rendered_frame.input_handlers.push(Some(input_handler));
-            }
-        }
+                false
+            };
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
         }
@@ -2760,7 +2801,7 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
-        if let Some(input_handler) = self
+        let has_input_handler = if let Some(input_handler) = self
             .next_frame
             .input_handlers
             .iter_mut()
@@ -2768,6 +2809,18 @@ impl Window {
             .find_map(|h| h.take())
         {
             self.platform_window.set_input_handler(input_handler);
+            true
+        } else {
+            false
+        };
+        match (had_input_handler, has_input_handler) {
+            (false, true) => self
+                .platform_window
+                .text_input_state_changed(TextInputStateChange::FocusGained),
+            (true, false) => self
+                .platform_window
+                .text_input_state_changed(TextInputStateChange::FocusLost),
+            _ => {}
         }
 
         self.layout_engine.as_mut().unwrap().clear();
@@ -3258,6 +3311,7 @@ impl Window {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
+            touch_listeners_index: self.next_frame.touch_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -3282,6 +3336,12 @@ impl Window {
         self.next_frame.mouse_listeners.extend(
             self.rendered_frame.mouse_listeners
                 [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+                .iter_mut()
+                .map(|listener| listener.take()),
+        );
+        self.next_frame.touch_listeners.extend(
+            self.rendered_frame.touch_listeners
+                [range.start.touch_listeners_index..range.end.touch_listeners_index]
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
@@ -4789,6 +4849,21 @@ impl Window {
         )));
     }
 
+    pub(crate) fn on_touch_event<Event: 'static>(
+        &mut self,
+        mut listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.touch_listeners.push(Some(Box::new(
+            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                if let Some(event) = event.downcast_ref() {
+                    listener(event, phase, window, cx)
+                }
+            },
+        )));
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -4936,6 +5011,33 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        if let PlatformInput::Touch(touch) = event {
+            let semantic_events = self.touch_gesture_arena.handle(&touch);
+            let mut result = self.dispatch_event_with_modality(
+                PlatformInput::Touch(touch),
+                Some(InputModality::Touch),
+                cx,
+            );
+            for semantic_event in semantic_events {
+                result = match semantic_event {
+                    TouchGestureOutput::PlatformInput(event) => {
+                        self.dispatch_event_with_modality(event, Some(InputModality::Touch), cx)
+                    }
+                    TouchGestureOutput::Click(event) => self.dispatch_touch_event(&event, cx),
+                };
+            }
+            return result;
+        }
+
+        self.dispatch_event_with_modality(event, None, cx)
+    }
+
+    fn dispatch_event_with_modality(
+        &mut self,
+        event: PlatformInput,
+        input_modality: Option<InputModality>,
+        cx: &mut App,
+    ) -> DispatchEventResult {
         #[cfg(feature = "input-latency-histogram")]
         let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
@@ -4943,12 +5045,12 @@ impl Window {
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
         let old_modality = self.last_input_modality;
-        self.last_input_modality = match &event {
+        self.last_input_modality = input_modality.unwrap_or_else(|| match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
-        };
+        });
         if self.last_input_modality != old_modality {
             self.refresh();
         }
@@ -5040,7 +5142,13 @@ impl Window {
                     PlatformInput::FileDrop(FileDropEvent::Exited)
                 }
             },
-            PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
+            PlatformInput::Touch(touch) => {
+                if touch.phase == crate::TouchPhase::Started {
+                    self.mouse_position = touch.position;
+                    self.mouse_hit_test = self.rendered_frame.hit_test(touch.position);
+                }
+                PlatformInput::Touch(touch)
+            }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
@@ -5065,6 +5173,41 @@ impl Window {
             default_prevented: self.default_prevented,
         }
     }
+
+    fn dispatch_touch_event(&mut self, event: &dyn Any, cx: &mut App) -> DispatchEventResult {
+        cx.propagate_event = true;
+        self.default_prevented = false;
+
+        let mut touch_listeners = mem::take(&mut self.rendered_frame.touch_listeners);
+        for listener in &mut touch_listeners {
+            let Some(listener) = listener.as_mut() else {
+                continue;
+            };
+            listener(event, DispatchPhase::Capture, self, cx);
+            if !cx.propagate_event {
+                break;
+            }
+        }
+
+        if cx.propagate_event {
+            for listener in touch_listeners.iter_mut().rev() {
+                let Some(listener) = listener.as_mut() else {
+                    continue;
+                };
+                listener(event, DispatchPhase::Bubble, self, cx);
+                if !cx.propagate_event {
+                    break;
+                }
+            }
+        }
+        self.rendered_frame.touch_listeners = touch_listeners;
+
+        DispatchEventResult {
+            propagate: cx.propagate_event,
+            default_prevented: self.default_prevented,
+        }
+    }
+
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());

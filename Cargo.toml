@@ -90,6 +90,9 @@ members = [
     "crates/google_ai",
     "crates/grammars",
     "crates/gpui",
+    "crates/gpui_apple",
+    "crates/gpui_ios",
+    "crates/gpui_ios/examples/ios",
     "crates/gpui_shared_string",
     "crates/gpui_linux",
     "crates/gpui_macos",
@@ -349,6 +352,8 @@ go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
 grammars = { path = "crates/grammars" }
 gpui = { path = "crates/gpui", default-features = false }
+gpui_apple = { path = "crates/gpui_apple" }
+gpui_ios = { path = "crates/gpui_ios" }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
 gpui_macos = { path = "crates/gpui_macos", default-features = false }
@@ -555,6 +560,7 @@ aws-smithy-types = { version = "1.3.4", features = ["http-body-1-x"] }
 backtrace = "0.3"
 base64 = "0.22"
 bitflags = "2.6.0"
+block = "0.1"
 block2 = "0.6"
 brotli = "8.0.2"
 bytes = "1.0"
@@ -575,6 +581,8 @@ const_format = "0.2"
 convert_case = "0.11.0"
 core-foundation = "0.10"
 core-foundation-sys = "0.8.6"
+core-graphics = "0.24"
+core-text = "21"
 core-video = { version = "0.5.2", features = ["metal"] }
 cpal = "0.17"
 crash-handler = "0.7"
@@ -601,9 +609,11 @@ ec4rs = { version = "1.2", features = ["allow-empty-values"] }
 emojis = "0.6.1"
 env_logger = "0.11"
 encoding_rs = "0.8"
+etagere = "0.2"
 exec = "0.3.1"
 fancy-regex = "0.18.0"
 fork = "0.4.0"
+foreign-types = "0.5"
 flume = "0.12"
 futures = "0.3.32"
 futures-concurrency = "7.7.1"
@@ -719,6 +729,7 @@ partial-json-fixer = "0.5.3"
 parse_int = "0.9"
 pciid-parser = "0.8.0"
 pathdiff = "0.2"
+pathfinder_geometry = "0.5"
 percent-encoding = "2.3.2"
 pet = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "9e61a22af989fe54937bf07c9f9cff1bc53d9056" }
 pet-conda = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "9e61a22af989fe54937bf07c9f9cff1bc53d9056" }

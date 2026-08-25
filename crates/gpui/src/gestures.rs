@@ -10,9 +10,85 @@
 //! [`PinchEvent`](crate::PinchEvent)s — so components written against
 //! `on_click` and scroll containers work untouched on mobile.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::{Pixels, Point, px};
+use smallvec::{SmallVec, smallvec};
+
+use crate::{
+    Axis, IsZero, Modifiers, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
+    TouchClickEvent, TouchEvent, TouchId, TouchPhase, px,
+};
+
+const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
+
+/// Tracks the dominant axis across the events in a scroll gesture.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OngoingScroll {
+    last_event: Option<Instant>,
+    axis: Option<Axis>,
+}
+
+impl OngoingScroll {
+    /// Filters the given delta to the dominant axis of the current scroll gesture.
+    ///
+    /// Gestures are delimited by their touch phase when available, with a timeout
+    /// fallback for platforms that only emit [`TouchPhase::Moved`].
+    pub fn filter(&mut self, delta: &mut Point<Pixels>, touch_phase: TouchPhase) {
+        self.filter_at(delta, touch_phase, Instant::now())
+    }
+
+    fn filter_at(&mut self, delta: &mut Point<Pixels>, touch_phase: TouchPhase, now: Instant) {
+        const UNLOCK_PERCENT: f32 = 1.9;
+        const UNLOCK_LOWER_BOUND: Pixels = px(6.);
+
+        if matches!(touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.last_event = None;
+            self.axis = None;
+            return;
+        }
+
+        let x = delta.x.abs();
+        let y = delta.y.abs();
+        if x.is_zero() && y.is_zero() {
+            if touch_phase == TouchPhase::Started {
+                self.last_event = None;
+                self.axis = None;
+            }
+            return;
+        }
+
+        let starts_new_gesture = touch_phase == TouchPhase::Started
+            || self
+                .last_event
+                .is_none_or(|last_event| now.duration_since(last_event) >= SCROLL_EVENT_SEPARATION);
+        let mut axis = self.axis;
+        if starts_new_gesture {
+            axis = if x <= y {
+                Some(Axis::Vertical)
+            } else {
+                Some(Axis::Horizontal)
+            };
+        } else if x.max(y) >= UNLOCK_LOWER_BOUND {
+            match axis {
+                Some(Axis::Vertical) if x > y && x >= y * UNLOCK_PERCENT => {
+                    axis = None;
+                }
+                Some(Axis::Horizontal) if y > x && y >= x * UNLOCK_PERCENT => {
+                    axis = None;
+                }
+                _ => {}
+            }
+        }
+
+        self.last_event = Some(now);
+        self.axis = axis;
+        match axis {
+            Some(Axis::Vertical) => delta.x = Pixels::ZERO,
+            Some(Axis::Horizontal) => delta.y = Pixels::ZERO,
+            None => {}
+        }
+    }
+}
 
 /// Feel constants consumed by gesture recognizers. Provided on a best-effort
 /// basis, depending on each platform's support, defaulting to GPUI's own
@@ -47,6 +123,114 @@ impl Default for GestureTuning {
             long_press_duration: Duration::from_millis(500),
             momentum_decay_per_ms: 0.998,
             min_fling_velocity: 50.,
+        }
+    }
+}
+
+pub(crate) struct TouchGestureArena {
+    tuning: GestureTuning,
+    active_touch: Option<ActiveTouch>,
+}
+
+pub(crate) enum TouchGestureOutput {
+    PlatformInput(PlatformInput),
+    Click(TouchClickEvent),
+}
+
+struct ActiveTouch {
+    id: TouchId,
+    start_position: Point<Pixels>,
+    last_position: Point<Pixels>,
+    is_panning: bool,
+}
+
+impl TouchGestureArena {
+    pub(crate) fn new(tuning: GestureTuning) -> Self {
+        Self {
+            tuning,
+            active_touch: None,
+        }
+    }
+
+    pub(crate) fn handle(&mut self, event: &TouchEvent) -> SmallVec<[TouchGestureOutput; 1]> {
+        match event.phase {
+            TouchPhase::Started => {
+                if self.active_touch.is_none() {
+                    self.active_touch = Some(ActiveTouch {
+                        id: event.id,
+                        start_position: event.position,
+                        last_position: event.position,
+                        is_panning: false,
+                    });
+                }
+                SmallVec::new()
+            }
+            TouchPhase::Moved => {
+                let Some(active_touch) = self
+                    .active_touch
+                    .as_mut()
+                    .filter(|active_touch| active_touch.id == event.id)
+                else {
+                    return SmallVec::new();
+                };
+
+                let mut touch_phase = TouchPhase::Moved;
+                let delta = if active_touch.is_panning {
+                    event.position - active_touch.last_position
+                } else if (event.position - active_touch.start_position).magnitude()
+                    > self.tuning.touch_slop.into()
+                {
+                    active_touch.is_panning = true;
+                    touch_phase = TouchPhase::Started;
+                    event.position - active_touch.start_position
+                } else {
+                    active_touch.last_position = event.position;
+                    return SmallVec::new();
+                };
+                active_touch.last_position = event.position;
+
+                smallvec![TouchGestureOutput::PlatformInput(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: event.position,
+                        delta: ScrollDelta::Pixels(delta),
+                        modifiers: Modifiers::default(),
+                        touch_phase,
+                    })
+                )]
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self
+                    .active_touch
+                    .as_ref()
+                    .is_none_or(|active_touch| active_touch.id != event.id)
+                {
+                    return SmallVec::new();
+                }
+                let Some(active_touch) = self.active_touch.take() else {
+                    return SmallVec::new();
+                };
+
+                if active_touch.is_panning {
+                    return smallvec![TouchGestureOutput::PlatformInput(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: event.position,
+                            delta: ScrollDelta::Pixels(event.position - active_touch.last_position),
+                            modifiers: Modifiers::default(),
+                            touch_phase: event.phase,
+                        })
+                    )];
+                }
+
+                if event.phase == TouchPhase::Cancelled {
+                    return SmallVec::new();
+                }
+
+                smallvec![TouchGestureOutput::Click(TouchClickEvent {
+                    position: active_touch.start_position,
+                    tap_count: 1,
+                    long_press: false,
+                })]
+            }
         }
     }
 }
@@ -121,3 +305,216 @@ pub trait PlatformGestures {
 pub struct NullPlatformGestures;
 
 impl PlatformGestures for NullPlatformGestures {}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::point;
+
+    #[test]
+    fn touch_gesture_arena_recognizes_tap() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let position = point(px(10.), px(20.));
+        let started = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position,
+            force: None,
+        };
+        assert!(arena.handle(&started).is_empty());
+
+        let ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..started
+        };
+        let output = arena.handle(&ended);
+        let Some(TouchGestureOutput::Click(click)) = output.first() else {
+            panic!("tap should produce a touch click");
+        };
+        assert_eq!(click.position, position);
+        assert_eq!(click.tap_count, 1);
+        assert!(!click.long_press);
+    }
+
+    #[test]
+    fn touch_gesture_arena_promotes_movement_to_scroll() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let started = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position: point(px(10.), px(20.)),
+            force: None,
+        };
+        arena.handle(&started);
+
+        let moved = TouchEvent {
+            phase: TouchPhase::Moved,
+            position: point(px(10.), px(40.)),
+            ..started.clone()
+        };
+        let output = arena.handle(&moved);
+        let Some(TouchGestureOutput::PlatformInput(PlatformInput::ScrollWheel(scroll))) =
+            output.first()
+        else {
+            panic!("pan should produce a scroll event");
+        };
+        assert_eq!(scroll.touch_phase, TouchPhase::Started);
+        let ScrollDelta::Pixels(delta) = scroll.delta else {
+            panic!("touch pan should scroll in pixels");
+        };
+        assert_eq!(delta, point(px(0.), px(20.)));
+
+        let ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..moved
+        };
+        let output = arena.handle(&ended);
+        let Some(TouchGestureOutput::PlatformInput(PlatformInput::ScrollWheel(scroll))) =
+            output.first()
+        else {
+            panic!("ending a pan should end the scroll");
+        };
+        assert_eq!(scroll.touch_phase, TouchPhase::Ended);
+    }
+
+    #[test]
+    fn secondary_touch_does_not_cancel_primary_touch() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let primary = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position: point(px(10.), px(20.)),
+            force: None,
+        };
+        arena.handle(&primary);
+
+        let secondary_ended = TouchEvent {
+            id: TouchId(2),
+            phase: TouchPhase::Ended,
+            ..primary.clone()
+        };
+        assert!(arena.handle(&secondary_ended).is_empty());
+
+        let primary_ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..primary
+        };
+        assert!(matches!(
+            arena.handle(&primary_ended).first(),
+            Some(TouchGestureOutput::Click(_))
+        ));
+    }
+
+    #[test]
+    fn ongoing_scroll_locks_to_dominant_axis() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Started, now);
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Horizontal));
+        assert_eq!(horizontal_delta, point(px(10.), px(0.)));
+
+        let mut continued_delta = point(px(3.), px(2.));
+        ongoing_scroll.filter_at(
+            &mut continued_delta,
+            TouchPhase::Moved,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Horizontal));
+        assert_eq!(continued_delta, point(px(3.), px(0.)));
+    }
+
+    #[test]
+    fn ongoing_scroll_unlocks_when_direction_changes() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Started, now);
+
+        let mut vertical_delta = point(px(2.), px(10.));
+        ongoing_scroll.filter_at(
+            &mut vertical_delta,
+            TouchPhase::Moved,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(ongoing_scroll.axis, None);
+        assert_eq!(vertical_delta, point(px(2.), px(10.)));
+    }
+
+    #[test]
+    fn ongoing_scroll_starts_new_gesture_at_timeout_boundary() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Moved, now);
+
+        let mut vertical_delta = point(px(2.), px(10.));
+        ongoing_scroll.filter_at(
+            &mut vertical_delta,
+            TouchPhase::Moved,
+            now + SCROLL_EVENT_SEPARATION,
+        );
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+        assert_eq!(vertical_delta, point(px(0.), px(10.)));
+    }
+
+    #[test]
+    fn ongoing_scroll_ignores_zero_delta_and_resets_when_ended() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Started, now);
+
+        let mut zero_delta = Point::default();
+        ongoing_scroll.filter_at(
+            &mut zero_delta,
+            TouchPhase::Ended,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(ongoing_scroll.axis, None);
+
+        let mut vertical_delta = point(px(2.), px(3.));
+        ongoing_scroll.filter_at(
+            &mut vertical_delta,
+            TouchPhase::Moved,
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+        assert_eq!(vertical_delta, point(px(0.), px(3.)));
+    }
+
+    #[test]
+    fn ongoing_scroll_ignores_zero_delta_movement() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Started, now);
+
+        let mut zero_delta = Point::default();
+        ongoing_scroll.filter_at(
+            &mut zero_delta,
+            TouchPhase::Moved,
+            now + SCROLL_EVENT_SEPARATION,
+        );
+
+        let mut vertical_delta = point(px(2.), px(10.));
+        ongoing_scroll.filter_at(
+            &mut vertical_delta,
+            TouchPhase::Moved,
+            now + SCROLL_EVENT_SEPARATION,
+        );
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Vertical));
+        assert_eq!(vertical_delta, point(px(0.), px(10.)));
+    }
+
+    #[test]
+    fn ongoing_scroll_supports_moved_only_platforms() {
+        let now = Instant::now();
+        let mut ongoing_scroll = OngoingScroll::default();
+        let mut horizontal_delta = point(px(10.), px(2.));
+        ongoing_scroll.filter_at(&mut horizontal_delta, TouchPhase::Moved, now);
+        assert_eq!(ongoing_scroll.axis, Some(Axis::Horizontal));
+        assert_eq!(horizontal_delta, point(px(10.), px(0.)));
+    }
+}
