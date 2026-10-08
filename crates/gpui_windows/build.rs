@@ -3,6 +3,7 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
+        verify_shader_layout();
         // Compile HLSL shaders
         #[cfg(not(debug_assertions))]
         compile_shaders();
@@ -240,3 +241,51 @@ mod shader_compilation {
 
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 use shader_compilation::compile_shaders;
+
+// GPU structured buffers use Rust's repr(C) field order. A missing field in
+// HLSL changes the buffer stride and makes subsequent draws read other data.
+#[cfg(any(target_os = "windows", test))]
+fn verify_shader_layout() {
+    fn fields(source: &str, name: &str, rust: bool) -> Vec<String> {
+        let declaration = format!("struct {name} {{");
+        source
+            .split_once(&declaration)
+            .expect("missing GPU structure")
+            .1
+            .split_once('}')
+            .expect("unterminated GPU structure")
+            .0
+            .lines()
+            .filter_map(|line| {
+                let line = line.split("//").next().unwrap().trim();
+                if rust {
+                    line.strip_prefix("pub ")?
+                        .split_once(':')
+                        .map(|(field, _)| field.to_string())
+                } else {
+                    line.strip_suffix(';')?
+                        .split_whitespace()
+                        .last()
+                        .map(str::to_string)
+                }
+            })
+            .collect()
+    }
+    let cpu = include_str!("../gpui/src/scene.rs");
+    let shader = include_str!("src/shaders.hlsl");
+    for name in ["EdgeFadeParams", "Quad", "PolychromeSprite"] {
+        assert_eq!(
+            fields(cpu, name, true),
+            fields(shader, name, false),
+            "{name}: Rust and HLSL GPU field order must match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shader_layout_tests {
+    #[test]
+    fn gpu_structure_field_order_matches_hlsl() {
+        super::verify_shader_layout();
+    }
+}

@@ -493,6 +493,35 @@ float quarter_ellipse_sdf(float2 pt, float2 radii) {
 **
 */
 
+// Mirrors gpui's EdgeFadeParams; zero bands disable their edges.
+struct EdgeFadeParams {
+    float top_y;
+    float bottom_y;
+    float band_top;
+    float band_bottom;
+    float left_x;
+    float right_x;
+    float band_left;
+    float band_right;
+};
+
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
+    float ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, saturate((position.y - fade.top_y) / fade.band_top));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, saturate((fade.bottom_y - position.y) / fade.band_bottom));
+    }
+    if (fade.band_left > 0.0) {
+        ramp = min(ramp, saturate((position.x - fade.left_x) / fade.band_left));
+    }
+    if (fade.band_right > 0.0) {
+        ramp = min(ramp, saturate((fade.right_x - position.x) / fade.band_right));
+    }
+    return ramp * ramp;
+}
+
 struct Quad {
     uint order;
     uint border_style;
@@ -502,6 +531,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    EdgeFadeParams fade;
 };
 
 struct QuadVertexOutput {
@@ -555,6 +585,8 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
+    float fade_alpha = edge_fade_alpha(input.position.xy, quad.fade);
+
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -566,7 +598,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, fade_alpha);
     }
 
     float2 size = quad.bounds.size;
@@ -625,7 +657,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, fade_alpha);
     }
 
     // Signed distance of the point to the outside edge of the quad's border
@@ -838,7 +870,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * fade_alpha);
 }
 
 /*
@@ -1209,6 +1241,7 @@ struct PolychromeSprite {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    EdgeFadeParams fade;
     AtlasTile tile;
 };
 
@@ -1253,6 +1286,6 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    color.a *= sprite.opacity * saturate(0.5 - distance);
+    color.a *= sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade);
     return color;
 }
